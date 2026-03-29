@@ -5,12 +5,15 @@
 //
 // Pass 1 — Candidate Collection (no lock required):
 //
-//  1. Open a ChunkMergeReader over the sorted chunk files produced by
-//     Phase 1 (catalog traversal → semi-sort → chunk-sort).
-//  2. Iterate prefixes "00".."ff" in lexicographic order with parallel
-//     read-ahead.  For each prefix, merge-join the sorted directory
-//     entries against the merge reader.  Any entry not matched is added
-//     to the candidate set.
+//  1. For each of the 256 byte prefixes (00..ff), open the corresponding
+//     sorted binary chunk file (if it exists) and the matching directory
+//     in the data store.  Merge-join the sorted directory entries against
+//     the chunk reader.  Any entry not matched is added to the candidate
+//     set.
+//
+//  2. Because each chunk file maps 1:1 to a directory prefix, all 256
+//     prefixes can be processed in parallel.  Parallelism is bounded by
+//     the ReadAhead configuration (default 16).
 //
 // Pass 2 — Locked Deletion:
 //
@@ -27,10 +30,12 @@ package sweep
 
 import (
 	"bufio"
+	"encoding/hex"
 	"fmt"
 	"log"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
 	"sync/atomic"
 
@@ -41,16 +46,18 @@ import (
 type Config struct {
 	// DataDir is the CVMFS data directory containing 00..ff subdirs.
 	DataDir string
-	// ChunkFiles is the list of sorted chunk file paths from ChunkSort.
-	ChunkFiles []string
+	// ChunkDir is the directory containing per-prefix chunk files
+	// (chunk-00 through chunk-ff) produced by hashsort.PrefixWrite +
+	// hashsort.SortChunks.
+	ChunkDir string
 	// DryRun logs deletions without actually removing files.
 	DryRun bool
 	// OutputWriter, if non-nil, receives one hash per line for every
 	// unreachable object found during dry-run or deletion.  The caller
 	// is responsible for flushing and closing the underlying file.
 	OutputWriter *bufio.Writer
-	// ReadAhead controls how many directory listings to issue in
-	// parallel.  Defaults to 3 if <= 0.
+	// ReadAhead controls how many prefix directories to process in
+	// parallel.  Defaults to 16 if <= 0.
 	ReadAhead int
 }
 
@@ -71,7 +78,7 @@ type Stats struct {
 	DeletedBySuffix [256]int64
 
 	// Two-pass specific counters.
-	CandidatesFound    int64 // after pass 1 merge-join
+	CandidatesFound     int64 // after pass 1 merge-join
 	CandidatesProtected int64 // removed by pass 2 delta
 }
 
@@ -98,14 +105,21 @@ func suffixFromName(name string) byte {
 }
 
 // ===================================================================
-// Pass 1: Candidate Collection
+// Pass 1: Candidate Collection (parallel, one prefix at a time)
 // ===================================================================
 
 // CollectCandidates performs the merge-join sweep and returns a map of
 // unreachable hash → Candidate.  No files are deleted.
 //
-// The stats argument is updated atomically for progress reporting
-// (FilesChecked, FilesRetained, PrefixesDone, CandidatesFound).
+// Each of the 256 prefixes is processed independently:
+//   - Open the per-prefix chunk file (if it exists)
+//   - List the corresponding data directory
+//   - Merge-join directory entries against the sorted chunk entries
+//
+// This is embarrassingly parallel since each prefix has its own chunk
+// file and directory.
+//
+// The stats argument is updated atomically for progress reporting.
 func CollectCandidates(cfg Config, stats *Stats) (map[string]Candidate, error) {
 	if stats == nil {
 		stats = &Stats{}
@@ -113,90 +127,161 @@ func CollectCandidates(cfg Config, stats *Stats) (map[string]Candidate, error) {
 
 	readAhead := cfg.ReadAhead
 	if readAhead <= 0 {
-		readAhead = 3
+		readAhead = 16
+	}
+
+	var mu sync.Mutex
+	candidates := make(map[string]Candidate)
+
+	// Semaphore for parallelism.
+	sem := make(chan struct{}, readAhead)
+	var wg sync.WaitGroup
+	var firstErr error
+	var errOnce sync.Once
+
+	for i := 0; i < 256; i++ {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(prefixIdx int) {
+			defer wg.Done()
+			defer func() { <-sem }()
+
+			prefix := fmt.Sprintf("%02x", prefixIdx)
+			local, err := collectPrefix(cfg, prefix, byte(prefixIdx), stats)
+			if err != nil {
+				errOnce.Do(func() {
+					firstErr = fmt.Errorf("prefix %s: %w", prefix, err)
+				})
+				atomic.AddInt64(&stats.PrefixesDone, 1)
+				return
+			}
+
+			if len(local) > 0 {
+				mu.Lock()
+				for k, v := range local {
+					candidates[k] = v
+				}
+				mu.Unlock()
+			}
+
+			atomic.AddInt64(&stats.PrefixesDone, 1)
+		}(i)
+	}
+
+	wg.Wait()
+	return candidates, firstErr
+}
+
+// collectPrefix processes a single byte prefix directory, merge-joining
+// the directory listing against the sorted chunk file for that prefix.
+func collectPrefix(cfg Config, prefix string, prefixByte byte, stats *Stats) (map[string]Candidate, error) {
+	dirPath := filepath.Join(cfg.DataDir, prefix)
+
+	// Read directory entries.
+	dirEntries, err := os.ReadDir(dirPath)
+	if os.IsNotExist(err) {
+		// Directory doesn't exist — skip the chunk too.
+		return nil, nil
+	}
+	if err != nil {
+		log.Printf("WARNING: reading directory %s: %v", dirPath, err)
+		atomic.AddInt64(&stats.Errors, 1)
+		return nil, nil
+	}
+
+	// Filter to regular files and build sorted file-hash list.
+	type fileEntry struct {
+		fullHash string // prefix + filename
+		filePath string
+	}
+	var files []fileEntry
+	for _, e := range dirEntries {
+		if e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		fullHash := prefix + name
+		files = append(files, fileEntry{
+			fullHash: fullHash,
+			filePath: filepath.Join(dirPath, name),
+		})
+	}
+
+	if len(files) == 0 {
+		return nil, nil
+	}
+
+	// Sort the file entries by fullHash for merge-join.
+	sort.Slice(files, func(i, j int) bool {
+		return files[i].fullHash < files[j].fullHash
+	})
+
+	// Open the chunk file for this prefix, if it exists.
+	chunkPath := hashsort.ChunkFileForPrefix(cfg.ChunkDir, prefixByte)
+	chunkExists := false
+	if _, err := os.Stat(chunkPath); err == nil {
+		chunkExists = true
 	}
 
 	candidates := make(map[string]Candidate)
 
-	if len(cfg.ChunkFiles) == 0 {
-		// No reachable hashes at all — everything is a candidate.
-		for i := 0; i < 256; i++ {
-			prefix := fmt.Sprintf("%02x", i)
-			collectAllInPrefix(cfg.DataDir, prefix, candidates, stats)
-			atomic.AddInt64(&stats.PrefixesDone, 1)
+	if !chunkExists {
+		// No reachable hashes for this prefix — everything is a candidate.
+		for _, f := range files {
+			atomic.AddInt64(&stats.FilesChecked, 1)
+			candidates[f.fullHash] = Candidate{
+				FullHash: f.fullHash,
+				FilePath: f.filePath,
+			}
+			atomic.AddInt64(&stats.CandidatesFound, 1)
 		}
 		return candidates, nil
 	}
 
-	reader, err := hashsort.NewChunkMergeReader(cfg.ChunkFiles)
+	// Open chunk reader.
+	reader, err := hashsort.NewChunkReader(chunkPath)
 	if err != nil {
-		return nil, fmt.Errorf("opening chunk merge reader: %w", err)
+		return nil, fmt.Errorf("opening chunk reader %s: %w", chunkPath, err)
 	}
 	defer reader.Close()
 
-	// ---- Parallel directory read-ahead with in-order delivery ----
-	dirCh := startReadAhead(cfg.DataDir, readAhead)
-
-	// Prime the reader with the first hash.
 	readerValid := reader.Next()
 
-	for dr := range dirCh {
-		if dr.missing {
-			for readerValid && reader.Value()[:2] == dr.prefix {
-				readerValid = reader.Next()
+	for _, f := range files {
+		atomic.AddInt64(&stats.FilesChecked, 1)
+
+		// To compare, convert the file's fullHash to the Entry string
+		// format.  The chunk entries are binary but we need string
+		// comparison against the file's fullHash (which is hex + optional
+		// suffix).
+		fileHashStr := f.fullHash
+
+		// Advance the reader past entries that sort before this file.
+		for readerValid {
+			readerStr := reader.ValueString()
+			if readerStr >= fileHashStr {
+				break
 			}
-			atomic.AddInt64(&stats.PrefixesDone, 1)
+			readerValid = reader.Next()
+		}
+
+		if readerValid && reader.ValueString() == fileHashStr {
+			// Reachable.
+			atomic.AddInt64(&stats.FilesRetained, 1)
+			readerValid = reader.Next()
 			continue
 		}
-		if dr.err != nil {
-			log.Printf("WARNING: reading directory %s: %v", dr.dirPath, dr.err)
-			atomic.AddInt64(&stats.Errors, 1)
-			atomic.AddInt64(&stats.PrefixesDone, 1)
-			continue
+
+		// Unreachable — record as candidate.
+		candidates[f.fullHash] = Candidate{
+			FullHash: f.fullHash,
+			FilePath: f.filePath,
 		}
-
-		hadFiles := false
-		for _, e := range dr.entries {
-			if e.IsDir() {
-				continue
-			}
-			hadFiles = true
-			name := e.Name()
-			fullHash := dr.prefix + name
-
-			atomic.AddInt64(&stats.FilesChecked, 1)
-
-			// Advance merge reader past entries before this file.
-			for readerValid && reader.Value() < fullHash {
-				readerValid = reader.Next()
-			}
-
-			if readerValid && reader.Value() == fullHash {
-				atomic.AddInt64(&stats.FilesRetained, 1)
-				readerValid = reader.Next()
-				continue
-			}
-
-			// Unreachable — record as candidate.
-			candidates[fullHash] = Candidate{
-				FullHash: fullHash,
-				FilePath: filepath.Join(dr.dirPath, name),
-			}
-			atomic.AddInt64(&stats.CandidatesFound, 1)
-		}
-
-		if !hadFiles {
-			for readerValid && reader.Value()[:2] == dr.prefix {
-				readerValid = reader.Next()
-			}
-		}
-		atomic.AddInt64(&stats.PrefixesDone, 1)
+		atomic.AddInt64(&stats.CandidatesFound, 1)
 	}
 
 	return candidates, nil
 }
-
-
 
 // ===================================================================
 // Pass 2: Delta Subtraction
@@ -283,86 +368,68 @@ func Run(cfg Config, stats *Stats) (*Stats, error) {
 }
 
 // ===================================================================
-// Read-ahead helpers
+// Utility: write chunk files from string hashes (for tests)
 // ===================================================================
 
-type dirResult struct {
-	prefix  string
-	dirPath string
-	entries []os.DirEntry
-	missing bool
-	err     error
-}
-
-// startReadAhead launches goroutines that read directories 00..ff in
-// parallel and delivers results in order via a channel.
-func startReadAhead(dataDir string, readAhead int) <-chan dirResult {
-	slots := make([]chan dirResult, 256)
-	for i := range slots {
-		slots[i] = make(chan dirResult, 1)
+// WriteChunkFromHashes is a test helper that writes a sorted binary
+// chunk file for the given prefix from a list of hex-encoded hash strings.
+// Each hash string is "hex" or "hexSUFFIX" where SUFFIX is a single byte.
+func WriteChunkFromHashes(chunkDir string, hashes []string) error {
+	if err := os.MkdirAll(chunkDir, 0755); err != nil {
+		return err
 	}
 
-	var nextIdx int64
-	var wg sync.WaitGroup
-	for w := 0; w < readAhead; w++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for {
-				idx := int(atomic.AddInt64(&nextIdx, 1) - 1)
-				if idx >= 256 {
-					return
-				}
-				prefix := fmt.Sprintf("%02x", idx)
-				dirPath := filepath.Join(dataDir, prefix)
-				entries, err := os.ReadDir(dirPath)
-				if os.IsNotExist(err) {
-					slots[idx] <- dirResult{prefix: prefix, dirPath: dirPath, missing: true}
-					continue
-				}
-				slots[idx] <- dirResult{prefix: prefix, dirPath: dirPath, entries: entries, err: err}
+	// Group by prefix byte.
+	byPrefix := make(map[byte][]hashsort.Entry)
+	for _, h := range hashes {
+		hexPart := h
+		var suffix byte
+		// Check if last char is a suffix (A-Z).
+		if len(h) > 0 {
+			last := h[len(h)-1]
+			if last >= 'A' && last <= 'Z' {
+				hexPart = h[:len(h)-1]
+				suffix = last
 			}
-		}()
-	}
-
-	dirCh := make(chan dirResult, readAhead)
-	go func() {
-		for i := 0; i < 256; i++ {
-			dirCh <- <-slots[i]
 		}
-		wg.Wait()
-		close(dirCh)
-	}()
 
-	return dirCh
-}
-
-// collectAllInPrefix adds every file in a prefix directory to the
-// candidates map (used when there are no reachable hashes at all).
-func collectAllInPrefix(dataDir, prefix string, candidates map[string]Candidate, stats *Stats) {
-	dirPath := filepath.Join(dataDir, prefix)
-	entries, err := os.ReadDir(dirPath)
-	if os.IsNotExist(err) {
-		return
-	}
-	if err != nil {
-		log.Printf("WARNING: reading directory %s: %v", dirPath, err)
-		atomic.AddInt64(&stats.Errors, 1)
-		return
-	}
-
-	for _, e := range entries {
-		if e.IsDir() {
+		if len(hexPart) < 2 {
 			continue
 		}
-		atomic.AddInt64(&stats.FilesChecked, 1)
-		name := e.Name()
-		fullHash := prefix + name
 
-		candidates[fullHash] = Candidate{
-			FullHash: fullHash,
-			FilePath: filepath.Join(dirPath, name),
+		b, err := hex.DecodeString(hexPart[:2])
+		if err != nil || len(b) < 1 {
+			continue
 		}
-		atomic.AddInt64(&stats.CandidatesFound, 1)
+
+		e := hashsort.EntryFromHexSuffix(hexPart, suffix)
+		byPrefix[b[0]] = append(byPrefix[b[0]], e)
 	}
+
+	for prefix, entries := range byPrefix {
+		// Sort entries.
+		sort.Slice(entries, func(i, j int) bool {
+			return hashsort.CompareEntries(entries[i], entries[j]) < 0
+		})
+
+		chunkPath := hashsort.ChunkFileForPrefix(chunkDir, prefix)
+		f, err := os.Create(chunkPath)
+		if err != nil {
+			return err
+		}
+		w := bufio.NewWriterSize(f, 64*1024)
+		for _, e := range entries {
+			if _, err := w.Write(e[:]); err != nil {
+				f.Close()
+				return err
+			}
+		}
+		if err := w.Flush(); err != nil {
+			f.Close()
+			return err
+		}
+		f.Close()
+	}
+
+	return nil
 }

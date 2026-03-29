@@ -10,6 +10,7 @@ import (
 func TestSweepDeletesUnreachable(t *testing.T) {
 	tmpDir := t.TempDir()
 	dataDir := filepath.Join(tmpDir, "data")
+	chunkDir := filepath.Join(tmpDir, "chunks")
 
 	// Create some fake object files under data/XX/...
 	// Reachable: aa/1111... and bb/2222...
@@ -39,26 +40,16 @@ func TestSweepDeletesUnreachable(t *testing.T) {
 		f.Close()
 	}
 
-	// Write sorted hash file as a single "chunk" (just the reachable ones).
+	// Write sorted chunk files from the reachable hashes.
 	sort.Strings(reachableHashes)
-	chunkDir := filepath.Join(tmpDir, "chunks")
-	if err := os.MkdirAll(chunkDir, 0755); err != nil {
-		t.Fatal(err)
+	if err := WriteChunkFromHashes(chunkDir, reachableHashes); err != nil {
+		t.Fatalf("WriteChunkFromHashes: %v", err)
 	}
-	chunkPath := filepath.Join(chunkDir, "chunk-000000.txt")
-	hf, err := os.Create(chunkPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, h := range reachableHashes {
-		hf.WriteString(h + "\n")
-	}
-	hf.Close()
 
 	cfg := Config{
-		DataDir:    dataDir,
-		ChunkFiles: []string{chunkPath},
-		DryRun:     false,
+		DataDir:  dataDir,
+		ChunkDir: chunkDir,
+		DryRun:   false,
 	}
 
 	stats, err := Run(cfg, nil)
@@ -89,6 +80,7 @@ func TestSweepDeletesUnreachable(t *testing.T) {
 func TestSweepDryRun(t *testing.T) {
 	tmpDir := t.TempDir()
 	dataDir := filepath.Join(tmpDir, "data")
+	chunkDir := filepath.Join(tmpDir, "chunks") // empty - no reachable hashes
 
 	// Create one unreachable file
 	hash := "ab" + pad("face", 36)
@@ -101,10 +93,11 @@ func TestSweepDryRun(t *testing.T) {
 	f.Close()
 
 	// No chunk files -- everything is unreachable
+	os.MkdirAll(chunkDir, 0755)
 	cfg := Config{
-		DataDir:    dataDir,
-		ChunkFiles: nil,
-		DryRun:     true,
+		DataDir:  dataDir,
+		ChunkDir: chunkDir,
+		DryRun:   true,
 	}
 
 	stats, err := Run(cfg, nil)
@@ -126,6 +119,7 @@ func TestSweepDryRun(t *testing.T) {
 func TestSweepMultipleChunks(t *testing.T) {
 	tmpDir := t.TempDir()
 	dataDir := filepath.Join(tmpDir, "data")
+	chunkDir := filepath.Join(tmpDir, "chunks")
 
 	// Create files across several prefixes.
 	reachable := []string{
@@ -150,31 +144,15 @@ func TestSweepMultipleChunks(t *testing.T) {
 		f.Close()
 	}
 
-	// Split reachable hashes across two chunk files.
-	sort.Strings(reachable)
-	chunkDir := filepath.Join(tmpDir, "chunks")
-	os.MkdirAll(chunkDir, 0755)
-
-	// Chunk 1: first two hashes
-	chunk1 := filepath.Join(chunkDir, "chunk-000000.txt")
-	f1, _ := os.Create(chunk1)
-	for _, h := range reachable[:2] {
-		f1.WriteString(h + "\n")
+	// Write chunk files from reachable hashes.
+	if err := WriteChunkFromHashes(chunkDir, reachable); err != nil {
+		t.Fatalf("WriteChunkFromHashes: %v", err)
 	}
-	f1.Close()
-
-	// Chunk 2: last two hashes
-	chunk2 := filepath.Join(chunkDir, "chunk-000001.txt")
-	f2, _ := os.Create(chunk2)
-	for _, h := range reachable[2:] {
-		f2.WriteString(h + "\n")
-	}
-	f2.Close()
 
 	cfg := Config{
-		DataDir:    dataDir,
-		ChunkFiles: []string{chunk1, chunk2},
-		DryRun:     false,
+		DataDir:  dataDir,
+		ChunkDir: chunkDir,
+		DryRun:   false,
 	}
 
 	stats, err := Run(cfg, nil)
@@ -216,6 +194,8 @@ func pad(s string, n int) string {
 func TestSweepDeletedBySuffix(t *testing.T) {
 	tmpDir := t.TempDir()
 	dataDir := filepath.Join(tmpDir, "data")
+	chunkDir := filepath.Join(tmpDir, "chunks")
+	os.MkdirAll(chunkDir, 0755)
 
 	// Create files with various suffixes — all unreachable.
 	// CVMFS filenames: prefix dir (2 hex chars) + rest-of-hash + optional suffix.
@@ -236,9 +216,9 @@ func TestSweepDeletedBySuffix(t *testing.T) {
 
 	// No reachable hashes — everything gets deleted.
 	cfg := Config{
-		DataDir:    dataDir,
-		ChunkFiles: nil,
-		DryRun:     true,
+		DataDir:  dataDir,
+		ChunkDir: chunkDir,
+		DryRun:   true,
 	}
 
 	stats, err := Run(cfg, nil)
@@ -272,6 +252,7 @@ func TestSweepDeletedBySuffix(t *testing.T) {
 func TestCollectCandidates(t *testing.T) {
 	tmpDir := t.TempDir()
 	dataDir := filepath.Join(tmpDir, "data")
+	chunkDir := filepath.Join(tmpDir, "chunks")
 
 	reachable := []string{
 		"aa" + pad("1111", 38),
@@ -290,19 +271,13 @@ func TestCollectCandidates(t *testing.T) {
 		f.Close()
 	}
 
-	sort.Strings(reachable)
-	chunkDir := filepath.Join(tmpDir, "chunks")
-	os.MkdirAll(chunkDir, 0755)
-	chunkPath := filepath.Join(chunkDir, "chunk-000000.txt")
-	hf, _ := os.Create(chunkPath)
-	for _, h := range reachable {
-		hf.WriteString(h + "\n")
+	if err := WriteChunkFromHashes(chunkDir, reachable); err != nil {
+		t.Fatalf("WriteChunkFromHashes: %v", err)
 	}
-	hf.Close()
 
 	cfg := Config{
-		DataDir:    dataDir,
-		ChunkFiles: []string{chunkPath},
+		DataDir:  dataDir,
+		ChunkDir: chunkDir,
 	}
 
 	var stats Stats

@@ -32,7 +32,7 @@ avoid unnecessary stat syscalls.
 ## Building
 
 ```bash
-# Native build
+# Native build (both cvmfs-gc and cvmfs-mirror)
 make
 
 # Cross-compile for Linux x86-64
@@ -50,10 +50,10 @@ cross-compilation requires nothing beyond the Go toolchain:
 
 ```bash
 make linux
-scp cvmfs-gc-linux-amd64 stratum1:/usr/local/bin/cvmfs-gc
+scp cvmfs-gc-linux-amd64 cvmfs-mirror-linux-amd64 stratum1:/usr/local/bin/
 ```
 
-The resulting binary is statically linked and can be copied directly to
+The resulting binaries are statically linked and can be copied directly to
 a Stratum-1 server with no runtime dependencies.
 
 ## Usage
@@ -78,15 +78,44 @@ cvmfs-gc -repo /srv/cvmfs/myrepo.example.org \
          -root-hash abc123...
 ```
 
-### Mirror (for testing)
+### Mirror server
 
-Download a small repository from a Stratum-1 to create a local test
-fixture:
+`cvmfs-mirror` is a long-running HTTP server that maintains a local
+pack-file-based mirror of a CVMFS repository.  It serves objects from
+local storage, falling back to the upstream Stratum-1 for cache misses,
+and runs periodic mirror + GC cycles in the background.
 
 ```bash
-cvmfs-gc -mirror \
-         -stratum1-url http://stratum1.example.org:8000/cvmfs/repo.example.org \
-         -repo /tmp/test-mirror
+cvmfs-mirror \
+    -url http://stratum1.example.org/cvmfs/repo.example.org \
+    -dir /srv/cvmfs/myrepo.example.org \
+    -listen :8080 \
+    -mirror-interval 15m \
+    -gc-interval 1h
+```
+
+Key features:
+
+- **Pack-file storage** — small objects (< 256 KB) are packed into large
+  files with mmap-backed indices, reducing inode pressure and improving
+  I/O patterns.
+- **Upstream fallback** — cache misses are proxied from the upstream
+  Stratum-1, with configurable concurrency and rate limiting.
+- **Background mirroring** — a full catalog-traversal mirror runs on a
+  configurable interval, streaming new objects into local packs.
+- **Background GC** — unreachable objects are identified via sorted-hash
+  join and removed by compacting pack files.
+- **Status endpoint** — `GET /.cvmfs_status.json` returns server state,
+  last mirror/GC timestamps, and object counts.
+
+#### One-shot mirror
+
+To run a single mirror cycle without starting the HTTP server:
+
+```bash
+cvmfs-mirror -once \
+    -url http://stratum1.example.org/cvmfs/repo.example.org \
+    -dir /tmp/test-mirror
 ```
 
 Then run GC against the mirror:
@@ -95,7 +124,7 @@ Then run GC against the mirror:
 cvmfs-gc -repo /tmp/test-mirror
 ```
 
-### All flags
+### cvmfs-gc flags
 
 | Flag | Default | Description |
 |------|---------|-------------|
@@ -111,14 +140,30 @@ cvmfs-gc -repo /tmp/test-mirror
 | `-stratum1-url` | | Base URL of the Stratum-1 (mirror mode only) |
 | `-mirror-jobs` | 8 | Parallel downloads for mirroring |
 
+### cvmfs-mirror flags
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `-url` | | Upstream Stratum-1 base URL (required) |
+| `-dir` | | Local repository directory (required) |
+| `-listen` | `:8080` | HTTP listen address |
+| `-mirror-interval` | `15m` | Interval between mirror cycles (`0` to disable) |
+| `-gc-interval` | `1h` | Interval between GC cycles (`0` to disable) |
+| `-parallelism` | `8` | Download parallelism for mirroring |
+| `-upstream-rate` | `0` | Upstream request rate limit (req/s, `0` = unlimited) |
+| `-once` | `false` | Run a single mirror cycle and exit (no server) |
+
 ## Project layout
 
 ```
-cmd/cvmfs-gc/   CLI entry point, manifest parsing, three-phase pipeline
-catalog/        Parallel CVMFS catalog-tree traversal, hash types, zlib decompression
-hashsort/       Semi-sort, chunk sort, k-way streaming merge reader
-sweep/          Directory sweep with merge-join deletion
-mirror/         Download a CVMFS repo snapshot from a Stratum-1
+cmd/cvmfs-gc/       CLI entry point, manifest parsing, three-phase GC pipeline
+cmd/cvmfs-mirror/   Mirror server CLI, wires mirror + GC into the HTTP server
+catalog/            Parallel CVMFS catalog-tree traversal, hash types, zlib decompression
+hashsort/           Semi-sort, chunk sort, k-way streaming merge reader
+sweep/              Directory sweep, pack compaction, GC cycle orchestration
+mirror/             Catalog-traversal mirror with pack-file storage
+packfile/           Pack-file writer, mmap-backed index, 256-way prefix lookup
+server/             HTTP server with upstream fallback, background mirror + GC
 ```
 
 ## License

@@ -1,0 +1,36 @@
+{
+  "name": "CVMFS GC + FUSE",
+  "build": {
+    "dockerfile": "Dockerfile"
+  },
+
+  // Required for unprivileged FUSE.
+  "runArgs": [
+    "--device=/dev/fuse",
+    "--cap-add=SYS_ADMIN",
+    "--security-opt=apparmor:unconfined"
+  ],
+
+  // Mount /dev/fuse into the container (Codespaces).
+  "mounts": [
+    "type=bind,source=/dev/fuse,target=/dev/fuse"
+  ],
+
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "golang.go"
+      ],
+      "settings": {
+        "go.toolsManagement.autoUpdate": true,
+        "go.testFlags": ["-v", "-count=1"],
+        "go.lintTool": "staticcheck"
+      }
+    }
+  },
+
+  // Verify FUSE works after container creation.
+  "postCreateCommand": ".devcontainer/setup-fuse.sh",
+
+  "remoteUser": "vscode"
+}

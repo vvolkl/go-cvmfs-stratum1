@@ -7,6 +7,7 @@ require (
 	github.com/go-git/go-billy/v5 v5.7.0
 	github.com/hanwen/go-fuse/v2 v2.9.0
 	github.com/willscott/go-nfs v0.0.3
+	golang.org/x/time v0.14.0
 	modernc.org/sqlite v1.45.0
 )
 

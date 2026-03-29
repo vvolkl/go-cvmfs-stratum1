@@ -16,21 +16,24 @@ import (
 
 // Progress holds atomic counters that callers can read to monitor traversal.
 type Progress struct {
+	CatalogsStarted   int64 // catalogs dispatched to workers
 	CatalogsProcessed int64 // catalogs fully processed
 	HashesEmitted     int64 // content hashes sent to output channel
+	CatalogsSkipped   int64 // catalogs skipped (already claimed by another traversal)
 
-        // CatalogHashes collects every catalog hash visited during
-        // traversal (root + all nested).  Populated by the dispatcher.
-        // Key: hex hash (string), Value: struct{}.
-        // Callers can use this to avoid re-walking known catalogs in a
-        // subsequent delta pass.
-        CatalogHashes sync.Map
+	// CatalogHashes collects every catalog hash visited during
+	// traversal (root + all nested).  Populated by the dispatcher.
+	// Key: hex hash (string), Value: struct{}.
+	// When multiple traversals share the same Progress, LoadOrStore
+	// is used to atomically claim ownership: if the hash is already
+	// present, the catalog (and its entire subtree) is skipped.
+	CatalogHashes sync.Map
 }
 
 // Hash represents a content-addressable hash with its suffix character.
 type Hash struct {
-        Hex    string // full hex-encoded hash
-        Suffix byte   // hash suffix character (0 for none)
+	Hex    string // full hex-encoded hash
+	Suffix byte   // hash suffix character (0 for none)
 }
 
 // String returns the hash with its suffix appended (if any).
@@ -80,6 +83,17 @@ type TraverseConfig struct {
 	Parallelism int
 	// TempDir is where catalog SQLite files are temporarily extracted.
 	TempDir string
+	// FetchCatalog, if non-nil, is called by TraverseMirror to download
+	// a catalog before processing it.  The function receives the hex hash
+	// and must write the catalog data to DataDir so that processCatalog
+	// can open it.  It is NOT called when the catalog already exists on
+	// disk (the existence check is done by the caller).
+	FetchCatalog func(hexHash string) error
+	// Processed, if non-nil, is a set of catalog hex hashes that have
+	// been fully processed by a previous or current mirror run.
+	// TraverseMirror checks this set (instead of on-disk file existence)
+	// to decide whether a catalog's subtree can be pruned.
+	Processed *ProcessedCatalogs
 }
 
 // TraverseFromRootHash starts a parallel traversal from the given root
@@ -98,9 +112,6 @@ func TraverseFromRootHash(cfg TraverseConfig, rootHash string, out chan<- Hash, 
 		cfg.Parallelism = 8
 	}
 
-	// The root catalog itself is a reachable object.
-	out <- Hash{Hex: rootHash, Suffix: SuffixCatalog}
-
 	// foundCh: workers send newly-discovered nested catalog hashes here.
 	// catalogCh: the dispatcher sends catalogs to workers for processing.
 	foundCh := make(chan []Hash, cfg.Parallelism)
@@ -117,10 +128,22 @@ func TraverseFromRootHash(cfg TraverseConfig, rootHash string, out chan<- Hash, 
 	// closes catalogCh so workers exit.
 	go func() {
 		var queue []Hash
-		queue = append(queue, Hash{Hex: rootHash, Suffix: SuffixCatalog})
+
+		// Claim the root catalog.  If another traversal (sharing
+		// the same Progress) already claimed it, this entire tree
+		// is a duplicate — close channels and exit immediately.
 		if prog != nil {
-			prog.CatalogHashes.Store(rootHash, struct{}{})
+			if _, loaded := prog.CatalogHashes.LoadOrStore(rootHash, struct{}{}); loaded {
+				// Already owned by another traversal.
+				atomic.AddInt64(&prog.CatalogsSkipped, 1)
+				close(catalogCh)
+				close(doneCh)
+				return
+			}
 		}
+		// The root catalog itself is a reachable object.
+		out <- Hash{Hex: rootHash, Suffix: SuffixCatalog}
+		queue = append(queue, Hash{Hex: rootHash, Suffix: SuffixCatalog})
 		inFlight := 0
 
 		for {
@@ -143,6 +166,9 @@ func TraverseFromRootHash(cfg TraverseConfig, rootHash string, out chan<- Hash, 
 			case sendCh <- sendVal:
 				queue = queue[1:]
 				inFlight++
+				if prog != nil {
+					atomic.AddInt64(&prog.CatalogsStarted, 1)
+				}
 			case nested, ok := <-foundCh:
 				if !ok {
 					// Should not happen, but be safe.
@@ -152,11 +178,16 @@ func TraverseFromRootHash(cfg TraverseConfig, rootHash string, out chan<- Hash, 
 				if nested == nil {
 					inFlight--
 				} else {
-					queue = append(queue, nested...)
-					if prog != nil {
-						for _, h := range nested {
-							prog.CatalogHashes.Store(h.Hex, struct{}{})
+					for _, h := range nested {
+						if prog != nil {
+							// Atomically claim this catalog.
+							// Skip if another traversal got it first.
+							if _, loaded := prog.CatalogHashes.LoadOrStore(h.Hex, struct{}{}); loaded {
+								atomic.AddInt64(&prog.CatalogsSkipped, 1)
+								continue
+							}
 						}
+						queue = append(queue, h)
 					}
 				}
 			}
@@ -457,6 +488,9 @@ func TraverseNewCatalogs(cfg TraverseConfig, rootHash string, seen map[string]st
 			case sendCh <- sendVal:
 				queue = queue[1:]
 				inFlight++
+				if prog != nil {
+					atomic.AddInt64(&prog.CatalogsStarted, 1)
+				}
 			case nested, ok := <-foundCh:
 				if !ok {
 					continue
@@ -505,6 +539,172 @@ func TraverseNewCatalogs(cfg TraverseConfig, rootHash string, seen map[string]st
 					case errCh <- fmt.Errorf("catalog %s: %w", catHash.Hex, err):
 					default:
 					}
+				}
+				if prog != nil {
+					atomic.AddInt64(&prog.CatalogsProcessed, 1)
+					atomic.AddInt64(&prog.HashesEmitted, nHashes)
+				}
+				if len(nested) > 0 {
+					foundCh <- nested
+				}
+				foundCh <- nil
+			}
+		}()
+	}
+
+	go func() {
+		<-doneCh
+		workerWg.Wait()
+		close(out)
+	}()
+
+	select {
+	case err := <-errCh:
+		return err
+	default:
+		return nil
+	}
+}
+
+// TraverseMirror is like TraverseFromRootHash but optimised for
+// incremental mirroring.  If a catalog's data file already exists on
+// disk (under cfg.DataDir), the catalog was downloaded by a previous
+// mirror run.  Because CVMFS catalogs are content-addressed, an
+// unchanged catalog implies unchanged nested-catalog references and
+// unchanged content hashes, so the entire subtree can be pruned.
+//
+// The shared Progress / LoadOrStore dedup across trees works exactly
+// as in TraverseFromRootHash.
+func TraverseMirror(cfg TraverseConfig, rootHash string, out chan<- Hash, prog *Progress) error {
+	if cfg.Parallelism <= 0 {
+		cfg.Parallelism = 8
+	}
+
+	foundCh := make(chan []Hash, cfg.Parallelism)
+	catalogCh := make(chan Hash, cfg.Parallelism)
+	errCh := make(chan error, 1)
+	doneCh := make(chan struct{})
+
+	catalogProcessed := func(hexHash string) bool {
+		if cfg.Processed != nil {
+			return cfg.Processed.Contains(hexHash)
+		}
+		// Fallback: check loose file on disk.
+		h := Hash{Hex: hexHash, Suffix: SuffixCatalog}
+		p := filepath.Join(cfg.DataDir, h.ObjectPath())
+		_, err := os.Stat(p)
+		return err == nil
+	}
+
+	// ---------- dispatcher ----------
+	go func() {
+		var queue []Hash
+
+		// Cross-tree dedup via shared Progress (same as TraverseFromRootHash).
+		if prog != nil {
+			if _, loaded := prog.CatalogHashes.LoadOrStore(rootHash, struct{}{}); loaded {
+				atomic.AddInt64(&prog.CatalogsSkipped, 1)
+				close(catalogCh)
+				close(doneCh)
+				return
+			}
+		}
+
+		// Mirror-specific: if the root catalog was already processed,
+		// nothing new to discover in this tree.
+		if catalogProcessed(rootHash) {
+			atomic.AddInt64(&prog.CatalogsSkipped, 1)
+			close(catalogCh)
+			close(doneCh)
+			return
+		}
+
+		// Root is new — emit it and start BFS.
+		out <- Hash{Hex: rootHash, Suffix: SuffixCatalog}
+		queue = append(queue, Hash{Hex: rootHash, Suffix: SuffixCatalog})
+		inFlight := 0
+
+		for {
+			var sendCh chan Hash
+			var sendVal Hash
+			if len(queue) > 0 {
+				sendCh = catalogCh
+				sendVal = queue[0]
+			}
+
+			if len(queue) == 0 && inFlight == 0 {
+				close(catalogCh)
+				close(doneCh)
+				return
+			}
+
+			select {
+			case sendCh <- sendVal:
+				queue = queue[1:]
+				inFlight++
+				if prog != nil {
+					atomic.AddInt64(&prog.CatalogsStarted, 1)
+				}
+			case nested, ok := <-foundCh:
+				if !ok {
+					continue
+				}
+				if nested == nil {
+					inFlight--
+				} else {
+					for _, h := range nested {
+						if prog != nil {
+							if _, loaded := prog.CatalogHashes.LoadOrStore(h.Hex, struct{}{}); loaded {
+								atomic.AddInt64(&prog.CatalogsSkipped, 1)
+								continue
+							}
+						}
+					// Mirror prune: skip catalogs already processed.
+					if catalogProcessed(h.Hex) {
+							atomic.AddInt64(&prog.CatalogsSkipped, 1)
+							continue
+						}
+						queue = append(queue, h)
+					}
+				}
+			}
+		}
+	}()
+
+	// ---------- workers ----------
+	var workerWg sync.WaitGroup
+	for i := 0; i < cfg.Parallelism; i++ {
+		workerWg.Add(1)
+		go func() {
+			defer workerWg.Done()
+			for catHash := range catalogCh {
+				// If a FetchCatalog callback is configured and the
+				// catalog file is not yet on disk, download it before
+				// processing.  This is the normal path for the mirror:
+				// the dispatcher already checked that the catalog is
+				// new (not on disk), so we need to fetch it now.
+				if cfg.FetchCatalog != nil {
+					catPath := filepath.Join(cfg.DataDir, catHash.ObjectPath())
+					if _, err := os.Stat(catPath); os.IsNotExist(err) {
+						if err := cfg.FetchCatalog(catHash.Hex); err != nil {
+							select {
+							case errCh <- fmt.Errorf("fetching catalog %s: %w", catHash.Hex, err):
+							default:
+							}
+							foundCh <- nil
+							continue
+						}
+					}
+				}
+
+				nested, nHashes, err := processCatalog(cfg, catHash, out)
+				if err != nil {
+					select {
+					case errCh <- fmt.Errorf("catalog %s: %w", catHash.Hex, err):
+					default:
+					}
+				} else if cfg.Processed != nil {
+					cfg.Processed.MarkProcessed(catHash.Hex)
 				}
 				if prog != nil {
 					atomic.AddInt64(&prog.CatalogsProcessed, 1)
